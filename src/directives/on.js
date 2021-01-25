@@ -1,9 +1,17 @@
-import { kebabCase } from '../utils'
+import { kebabCase, camelCase, debounce, isNumeric } from '../utils'
 
 export function registerListener(component, el, event, modifiers, expression, extraVars = {}) {
+    const options = {
+        passive: modifiers.includes('passive'),
+    };
+
+    if (modifiers.includes('camel')) {
+        event = camelCase(event);
+    }
+
     if (modifiers.includes('away')) {
-        const handler = e => {
-            // Don't do anything if the click came form the element or within it.
+        let handler = e => {
+            // Don't do anything if the click came from the element or within it.
             if (el.contains(e.target)) return
 
             // Don't do anything if this element isn't currently visible.
@@ -14,17 +22,26 @@ export function registerListener(component, el, event, modifiers, expression, ex
             runListenerHandler(component, expression, e, extraVars)
 
             if (modifiers.includes('once')) {
-                document.removeEventListener(event, handler)
+                document.removeEventListener(event, handler, options)
             }
         }
 
         // Listen for this event at the root level.
-        document.addEventListener(event, handler)
+        document.addEventListener(event, handler, options)
     } else {
-        const listenerTarget = modifiers.includes('window')
+        let listenerTarget = modifiers.includes('window')
             ? window : (modifiers.includes('document') ? document : el)
 
-        const handler = e => {
+        let handler = e => {
+            // Remove this global event handler if the element that declared it
+            // has been removed. It's now stale.
+            if (listenerTarget === window || listenerTarget === document) {
+                if (! document.body.contains(el)) {
+                    listenerTarget.removeEventListener(event, handler, options)
+                    return
+                }
+            }
+
             if (isKeyEvent(event)) {
                 if (isListeningForASpecificKeyThatHasntBeenPressed(e, modifiers)) {
                     return
@@ -34,19 +51,36 @@ export function registerListener(component, el, event, modifiers, expression, ex
             if (modifiers.includes('prevent')) e.preventDefault()
             if (modifiers.includes('stop')) e.stopPropagation()
 
-            runListenerHandler(component, expression, e, extraVars)
+            // If the .self modifier isn't present, or if it is present and
+            // the target element matches the element we are registering the
+            // event on, run the handler
+            if (! modifiers.includes('self') || e.target === el) {
+                const returnValue = runListenerHandler(component, expression, e, extraVars)
 
-            if (modifiers.includes('once')) {
-                listenerTarget.removeEventListener(event, handler)
+                returnValue.then(value => {
+                    if (value === false) {
+                        e.preventDefault()
+                    } else {
+                        if (modifiers.includes('once')) {
+                            listenerTarget.removeEventListener(event, handler, options)
+                        }
+                    }
+                })
             }
         }
 
-        listenerTarget.addEventListener(event, handler)
+        if (modifiers.includes('debounce')) {
+            let nextModifier = modifiers[modifiers.indexOf('debounce')+1] || 'invalid-wait'
+            let wait = isNumeric(nextModifier.split('ms')[0]) ? Number(nextModifier.split('ms')[0]) : 250
+            handler = debounce(handler, wait, this)
+        }
+
+        listenerTarget.addEventListener(event, handler, options)
     }
 }
 
 function runListenerHandler(component, expression, e, extraVars) {
-    component.evaluateCommandExpression(e.target, expression, () => {
+    return component.evaluateCommandExpression(e.target, expression, () => {
         return {...extraVars(), '$event': e}
     })
 }
@@ -59,6 +93,11 @@ function isListeningForASpecificKeyThatHasntBeenPressed(e, modifiers) {
     let keyModifiers = modifiers.filter(i => {
         return ! ['window', 'document', 'prevent', 'stop'].includes(i)
     })
+
+    if (keyModifiers.includes('debounce')) {
+        let debounceIndex = keyModifiers.indexOf('debounce')
+        keyModifiers.splice(debounceIndex, isNumeric((keyModifiers[debounceIndex+1] || 'invalid-wait').split('ms')[0]) ? 2 : 1)
+    }
 
     // If no modifier is specified, we'll call it a press.
     if (keyModifiers.length === 0) return false
@@ -99,6 +138,6 @@ function keyToModifier(key) {
         case 'Spacebar':
             return 'space'
         default:
-            return kebabCase(key)
+            return key && kebabCase(key)
     }
 }

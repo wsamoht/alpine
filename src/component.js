@@ -1,49 +1,95 @@
-import { walk, saferEval, saferEvalNoReturn, getXAttrs, debounce } from './utils'
+import { walk, saferEval, saferEvalNoReturn, getXAttrs, debounce, convertClassStringToArray, TRANSITION_CANCELLED } from './utils'
 import { handleForDirective } from './directives/for'
 import { handleAttributeBindingDirective } from './directives/bind'
+import { handleTextDirective } from './directives/text'
+import { handleHtmlDirective } from './directives/html'
 import { handleShowDirective } from './directives/show'
 import { handleIfDirective } from './directives/if'
 import { registerModelListener } from './directives/model'
 import { registerListener } from './directives/on'
+import { unwrap, wrap } from './observable'
+import Alpine from './index'
 
 export default class Component {
-    constructor(el) {
+    constructor(el, componentForClone = null) {
         this.$el = el
 
         const dataAttr = this.$el.getAttribute('x-data')
         const dataExpression = dataAttr === '' ? '{}' : dataAttr
         const initExpression = this.$el.getAttribute('x-init')
-        const createdExpression = this.$el.getAttribute('x-created')
-        const mountedExpression = this.$el.getAttribute('x-mounted')
 
-        const unobservedData = saferEval(dataExpression, {})
+        let dataExtras = {
+            $el: this.$el,
+        }
+
+        let canonicalComponentElementReference = componentForClone ? componentForClone.$el : this.$el
+
+        Object.entries(Alpine.magicProperties).forEach(([name, callback]) => {
+            Object.defineProperty(dataExtras, `$${name}`, { get: function () { return callback(canonicalComponentElementReference) } });
+        })
+
+        this.unobservedData = componentForClone ? componentForClone.getUnobservedData() : saferEval(el, dataExpression, dataExtras)
+
+        /* IE11-ONLY:START */
+            // For IE11, add our magic properties to the original data for access.
+            // The Proxy polyfill does not allow properties to be added after creation.
+            this.unobservedData.$el = null
+            this.unobservedData.$refs = null
+            this.unobservedData.$nextTick = null
+            this.unobservedData.$watch = null
+            // The IE build uses a proxy polyfill which doesn't allow properties
+            // to be defined after the proxy object is created so,
+            // for IE only, we need to define our helpers earlier.
+            Object.entries(Alpine.magicProperties).forEach(([name, callback]) => {
+                Object.defineProperty(this.unobservedData, `$${name}`, { get: function () { return callback(canonicalComponentElementReference, this.$el) } });
+            })
+        /* IE11-ONLY:END */
 
         // Construct a Proxy-based observable. This will be used to handle reactivity.
-        this.$data = this.wrapDataInObservable(unobservedData)
+        let { membrane, data } = this.wrapDataInObservable(this.unobservedData)
+        this.$data = data
+        this.membrane = membrane
 
         // After making user-supplied data methods reactive, we can now add
         // our magic properties to the original data for access.
-        unobservedData.$el = this.$el
-        unobservedData.$refs = this.getRefsProxy()
+        this.unobservedData.$el = this.$el
+        this.unobservedData.$refs = this.getRefsProxy()
 
         this.nextTickStack = []
-        unobservedData.$nextTick = (callback) => {
+        this.unobservedData.$nextTick = (callback) => {
             this.nextTickStack.push(callback)
         }
 
+        this.watchers = {}
+        this.unobservedData.$watch = (property, callback) => {
+            if (! this.watchers[property]) this.watchers[property] = []
+
+            this.watchers[property].push(callback)
+        }
+
+
+        /* MODERN-ONLY:START */
+        // We remove this piece of code from the legacy build.
+        // In IE11, we have already defined our helpers at this point.
+
+        // Register custom magic properties.
+        Object.entries(Alpine.magicProperties).forEach(([name, callback]) => {
+            Object.defineProperty(this.unobservedData, `$${name}`, { get: function () { return callback(canonicalComponentElementReference, this.$el) } });
+        })
+        /* MODERN-ONLY:END */
+
+        this.showDirectiveStack = []
+        this.showDirectiveLastElement
+
+        componentForClone || Alpine.onBeforeComponentInitializeds.forEach(callback => callback(this))
+
         var initReturnedCallback
-        if (initExpression) {
+        // If x-init is present AND we aren't cloning (skip x-init on clone)
+        if (initExpression && ! componentForClone) {
             // We want to allow data manipulation, but not trigger DOM updates just yet.
             // We haven't even initialized the elements with their Alpine bindings. I mean c'mon.
             this.pauseReactivity = true
             initReturnedCallback = this.evaluateReturnExpression(this.$el, initExpression)
-            this.pauseReactivity = false
-        }
-
-        if (createdExpression) {
-            console.warn('AlpineJS Warning: "x-created" is deprecated and will be removed in the next major version. Use "x-init" instead.')
-            this.pauseReactivity = true
-            saferEvalNoReturn(this.$el.getAttribute('x-created'), this.$data)
             this.pauseReactivity = false
         }
 
@@ -55,70 +101,80 @@ export default class Component {
         this.listenForNewElementsToInitialize()
 
         if (typeof initReturnedCallback === 'function') {
-            // Run the callback returned form the "x-init" hook to allow the user to do stuff after
+            // Run the callback returned from the "x-init" hook to allow the user to do stuff after
             // Alpine's got it's grubby little paws all over everything.
             initReturnedCallback.call(this.$data)
         }
 
-        if (mountedExpression) {
-            console.warn('AlpineJS Warning: "x-mounted" is deprecated and will be removed in the next major version. Use "x-init" (with a callback return) for the same behavior.')
-            // Run an "x-mounted" hook to allow the user to do stuff after
-            // Alpine's got it's grubby little paws all over everything.
-            saferEvalNoReturn(mountedExpression, this.$data)
-        }
+        componentForClone || setTimeout(() => {
+            Alpine.onComponentInitializeds.forEach(callback => callback(this))
+        }, 0)
+    }
+
+    getUnobservedData() {
+        return unwrap(this.membrane, this.$data)
     }
 
     wrapDataInObservable(data) {
         var self = this
 
-        const proxyHandler = {
-            set(obj, property, value) {
-                // If value is an Alpine proxy (i.e. an element returned when sorting a list of objects),
-                // we want to set the original element to avoid a matryoshka effect (nested proxies).
-                const setWasSuccessful = value['$isAlpineProxy']
-                    ? Reflect.set(obj, property, value['$originalTarget'])
-                    : Reflect.set(obj, property, value)
+        let updateDom = debounce(function () {
+            self.updateElements(self.$el)
+        }, 0)
 
-                // Don't react to data changes for cases like the `x-created` hook.
-                if (self.pauseReactivity) return setWasSuccessful
+        return wrap(data, (target, key) => {
+            if (self.watchers[key]) {
+                // If there's a watcher for this specific key, run it.
+                self.watchers[key].forEach(callback => callback(target[key]))
+            } else if (Array.isArray(target)) {
+                // Arrays are special cases, if any of the items change, we consider the array as mutated.
+                Object.keys(self.watchers)
+                    .forEach(fullDotNotationKey => {
+                        let dotNotationParts = fullDotNotationKey.split('.')
 
-                debounce(() => {
-                    self.updateElements(self.$el)
+                        // Ignore length mutations since they would result in duplicate calls.
+                        // For example, when calling push, we would get a mutation for the item's key
+                        // and a second mutation for the length property.
+                        if (key === 'length') return
 
-                    // Walk through the $nextTick stack and clear it as we go.
-                    while (self.nextTickStack.length > 0) {
-                        self.nextTickStack.shift()()
-                    }
-                }, 0)()
+                        dotNotationParts.reduce((comparisonData, part) => {
+                            if (Object.is(target, comparisonData[part])) {
+                                self.watchers[fullDotNotationKey].forEach(callback => callback(target))
+                            }
 
-                return setWasSuccessful
-            },
-            get(target, key) {
-                // Provide a way to determine if this object is an Alpine proxy or not.
-                if (key === "$isAlpineProxy") return true
+                            return comparisonData[part]
+                        }, self.unobservedData)
+                    })
+            } else {
+                // Let's walk through the watchers with "dot-notation" (foo.bar) and see
+                // if this mutation fits any of them.
+                Object.keys(self.watchers)
+                    .filter(i => i.includes('.'))
+                    .forEach(fullDotNotationKey => {
+                        let dotNotationParts = fullDotNotationKey.split('.')
 
-                // Provide a hook to access the underlying "proxied" data directly.
-                if (key === "$originalTarget") return target
+                        // If this dot-notation watcher's last "part" doesn't match the current
+                        // key, then skip it early for performance reasons.
+                        if (key !== dotNotationParts[dotNotationParts.length - 1]) return
 
-                // If the property we are trying to get is a proxy, just return it.
-                // Like in the case of $refs
-                if (target[key] && target[key].$isRefsProxy) return target[key]
+                        // Now, walk through the dot-notation "parts" recursively to find
+                        // a match, and call the watcher if one's found.
+                        dotNotationParts.reduce((comparisonData, part) => {
+                            if (Object.is(target, comparisonData)) {
+                                // Run the watchers.
+                                self.watchers[fullDotNotationKey].forEach(callback => callback(target[key]))
+                            }
 
-                // If property is a DOM node, just return it. (like in the case of this.$el)
-                if (target[key] && target[key] instanceof Node) return target[key]
-
-                // If accessing a nested property, return this proxy recursively.
-                // This enables reactivity on setting nested data.
-                if (typeof target[key] === 'object' && target[key] !== null) {
-                    return new Proxy(target[key], proxyHandler)
-                }
-
-                // If none of the above, just return the flippin' value. Gawsh.
-                return target[key]
+                            return comparisonData[part]
+                        }, self.unobservedData)
+                    })
             }
-        }
 
-        return new Proxy(data, proxyHandler)
+            // Don't react to data changes for cases like the `x-created` hook.
+            if (self.pauseReactivity) return
+
+            updateDom()
+        })
     }
 
     walkAndSkipNestedComponents(el, callback, initializeComponentCallback = () => {}) {
@@ -144,22 +200,24 @@ export default class Component {
             // Don't touch spawns from for loop
             if (el.__x_for_key !== undefined) return false
 
+            // Don't touch spawns from if directives
+            if (el.__x_inserted_me !== undefined) return false
+
             this.initializeElement(el, extraVars)
         }, el => {
             el.__x = new Component(el)
         })
 
-        // Walk through the $nextTick stack and clear it as we go.
-        while (this.nextTickStack.length > 0) {
-            this.nextTickStack.shift()()
-        }
+        this.executeAndClearRemainingShowDirectiveStack()
+
+        this.executeAndClearNextTickStack(rootEl)
     }
 
     initializeElement(el, extraVars) {
         // To support class attribute merging, we have to know what the element's
         // original class attribute looked like for reference.
-        if (el.hasAttribute('class') && getXAttrs(el).length > 0) {
-            el.__x_original_classes = el.getAttribute('class').split(' ')
+        if (el.hasAttribute('class') && getXAttrs(el, this).length > 0) {
+            el.__x_original_classes = convertClassStringToArray(el.getAttribute('class'))
         }
 
         this.registerListeners(el, extraVars)
@@ -175,6 +233,46 @@ export default class Component {
         }, el => {
             el.__x = new Component(el)
         })
+
+        this.executeAndClearRemainingShowDirectiveStack()
+
+        this.executeAndClearNextTickStack(rootEl)
+    }
+
+    executeAndClearNextTickStack(el) {
+        // Skip spawns from alpine directives
+        if (el === this.$el && this.nextTickStack.length > 0) {
+            // We run the tick stack after the next frame to allow any
+            // running transitions to pass the initial show stage.
+            requestAnimationFrame(() => {
+                while (this.nextTickStack.length > 0) {
+                    this.nextTickStack.shift()()
+                }
+            })
+        }
+    }
+
+    executeAndClearRemainingShowDirectiveStack() {
+        // The goal here is to start all the x-show transitions
+        // and build a nested promise chain so that elements
+        // only hide when the children are finished hiding.
+        this.showDirectiveStack.reverse().map(handler => {
+            return new Promise((resolve, reject) => {
+                handler(resolve, reject)
+            })
+        }).reduce((promiseChain, promise) => {
+            return promiseChain.then(() => {
+                return promise.then(finishElement => {
+                    finishElement()
+                })
+            })
+        }, Promise.resolve(() => {})).catch(e => {
+            if (e !== TRANSITION_CANCELLED) throw e
+        })
+
+        // We've processed the handler stack. let's clear it.
+        this.showDirectiveStack = []
+        this.showDirectiveLastElement = undefined
     }
 
     updateElement(el, extraVars) {
@@ -182,7 +280,7 @@ export default class Component {
     }
 
     registerListeners(el, extraVars) {
-        getXAttrs(el).forEach(({ type, value, modifiers, expression }) => {
+        getXAttrs(el, this).forEach(({ type, value, modifiers, expression }) => {
             switch (type) {
                 case 'on':
                     registerListener(this, el, value, modifiers, expression, extraVars)
@@ -198,48 +296,48 @@ export default class Component {
     }
 
     resolveBoundAttributes(el, initialUpdate = false, extraVars) {
-        getXAttrs(el).forEach(({ type, value, modifiers, expression }) => {
+        let attrs = getXAttrs(el, this)
+        attrs.forEach(({ type, value, modifiers, expression }) => {
             switch (type) {
                 case 'model':
-                    handleAttributeBindingDirective(this, el, 'value', expression, extraVars)
+                    handleAttributeBindingDirective(this, el, 'value', expression, extraVars, type, modifiers)
                     break;
 
                 case 'bind':
                     // The :key binding on an x-for is special, ignore it.
                     if (el.tagName.toLowerCase() === 'template' && value === 'key') return
 
-                    handleAttributeBindingDirective(this, el, value, expression, extraVars)
+                    handleAttributeBindingDirective(this, el, value, expression, extraVars, type, modifiers)
                     break;
 
                 case 'text':
                     var output = this.evaluateReturnExpression(el, expression, extraVars);
 
-                    // If nested model key is undefined, set the default value to empty string.
-                    if (output === undefined && expression.match(/\./).length) {
-                        output = ''
-                    }
-
-                    el.innerText = output
+                    handleTextDirective(el, output, expression)
                     break;
 
                 case 'html':
-                    el.innerHTML = this.evaluateReturnExpression(el, expression, extraVars)
+                    handleHtmlDirective(this, el, expression, extraVars)
                     break;
 
                 case 'show':
                     var output = this.evaluateReturnExpression(el, expression, extraVars)
 
-                    handleShowDirective(el, output, initialUpdate)
+                    handleShowDirective(this, el, output, modifiers, initialUpdate)
                     break;
 
                 case 'if':
+                    // If this element also has x-for on it, don't process x-if.
+                    // We will let the "x-for" directive handle the "if"ing.
+                    if (attrs.some(i => i.type === 'for')) return
+
                     var output = this.evaluateReturnExpression(el, expression, extraVars)
 
-                    handleIfDirective(el, output, initialUpdate)
+                    handleIfDirective(this, el, output, initialUpdate, extraVars)
                     break;
 
                 case 'for':
-                    handleForDirective(this, el, expression, initialUpdate)
+                    handleForDirective(this, el, expression, initialUpdate, extraVars)
                     break;
 
                 case 'cloak':
@@ -253,14 +351,14 @@ export default class Component {
     }
 
     evaluateReturnExpression(el, expression, extraVars = () => {}) {
-        return saferEval(expression, this.$data, {
+        return saferEval(el, expression, this.$data, {
             ...extraVars(),
             $dispatch: this.getDispatchFunction(el),
         })
     }
 
     evaluateCommandExpression(el, expression, extraVars = () => {}) {
-        saferEvalNoReturn(expression, this.$data, {
+        return saferEvalNoReturn(el, expression, this.$data, {
             ...extraVars(),
             $dispatch: this.getDispatchFunction(el),
         })
@@ -285,13 +383,15 @@ export default class Component {
         }
 
         const observer = new MutationObserver((mutations) => {
-            for (let i=0; i < mutations.length; i++){
+            for (let i=0; i < mutations.length; i++) {
                 // Filter out mutations triggered from child components.
                 const closestParentComponent = mutations[i].target.closest('[x-data]')
-                if (! (closestParentComponent && closestParentComponent.isSameNode(this.$el))) return
+
+                if (! (closestParentComponent && closestParentComponent.isSameNode(this.$el))) continue
 
                 if (mutations[i].type === 'attributes' && mutations[i].attributeName === 'x-data') {
-                    const rawData = saferEval(mutations[i].target.getAttribute('x-data'), {})
+                    const xAttr = mutations[i].target.getAttribute('x-data') || '{}';
+                    const rawData = saferEval(this.$el, xAttr, { $el: this.$el })
 
                     Object.keys(rawData).forEach(key => {
                         if (this.$data[key] !== rawData[key]) {
@@ -302,9 +402,9 @@ export default class Component {
 
                 if (mutations[i].addedNodes.length > 0) {
                     mutations[i].addedNodes.forEach(node => {
-                        if (node.nodeType !== 1) return
+                        if (node.nodeType !== 1 || node.__x_inserted_me) return
 
-                        if (node.matches('[x-data]')) {
+                        if (node.matches('[x-data]') && ! node.__x) {
                             node.__x = new Component(node)
                             return
                         }
@@ -321,13 +421,29 @@ export default class Component {
     getRefsProxy() {
         var self = this
 
+        var refObj = {}
+
+        /* IE11-ONLY:START */
+            // Add any properties up-front that might be necessary for the Proxy polyfill.
+            refObj.$isRefsProxy = false;
+            refObj.$isAlpineProxy = false;
+
+            // If we are in IE, since the polyfill needs all properties to be defined before building the proxy,
+            // we just loop on the element, look for any x-ref and create a tmp property on a fake object.
+            this.walkAndSkipNestedComponents(self.$el, el => {
+                if (el.hasAttribute('x-ref')) {
+                    refObj[el.getAttribute('x-ref')] = true
+                }
+            })
+        /* IE11-ONLY:END */
+
         // One of the goals of this is to not hold elements in memory, but rather re-evaluate
         // the DOM when the system needs something from it. This way, the framework is flexible and
         // friendly to outside DOM changes from libraries like Vue/Livewire.
         // For this reason, I'm using an "on-demand" proxy to fake a "$refs" object.
-        return new Proxy({}, {
+        return new Proxy(refObj, {
             get(object, property) {
-                if (property === '$isRefsProxy') return true
+                if (property === '$isAlpineProxy') return true
 
                 var ref
 
